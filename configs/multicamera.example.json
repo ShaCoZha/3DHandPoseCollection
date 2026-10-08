@@ -1,0 +1,45 @@
+{
+  "python": "~/environments/pyspin/bin/python",
+  "wilorPython": "~/environments/wilor/bin/python",
+  "aniposePython": "~/environments/anipose/bin/python",
+  "detectorScript": "../legacy/wilor_mini_detector.py",
+  "calibration": "../data/calibration/calibration.toml",
+  "cameras": [
+    {
+      "name": "cam01",
+      "serial": "25132928"
+    },
+    {
+      "name": "cam02",
+      "serial": "25132918"
+    },
+    {
+      "name": "cam03",
+      "serial": "25132909"
+    },
+    {
+      "name": "cam04",
+      "serial": "25132908"
+    }
+  ],
+  "fps": 20,
+  "clockIntervalSeconds": 30,
+  "maxPairSkewMs": 35,
+  "hand": "right",
+  "autoProcess": true,
+  "regularizeHandpose": true,
+  "regularizationPython": "~/environments/handpose/bin/python",
+  "regularization": {
+    "windowFrames": 80,
+    "overlapFrames": 20,
+    "maxGapSeconds": 0.12,
+    "accelerationScale": 3.0,
+    "boneRelativeSigma": 0.05,
+    "boneMinimumSigmaMetres": 0.002,
+    "anchorThreeViewSigmaMetres": 0.003,
+    "anchorTwoViewSigmaMetres": 0.007,
+    "maxEvaluations": 200
+  },
+  "weightedHandpose": true,
+  "reliabilityPython": "~/environments/handpose/bin/python"
+}
