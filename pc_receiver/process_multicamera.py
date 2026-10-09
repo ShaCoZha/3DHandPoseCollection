@@ -93,6 +93,9 @@ def detect(root, config):
 def triangulate(root, config):
     import numpy as np
     from aniposelib.cameras import CameraGroup
+    threshold = float(config.get('triangulationReprojectionThresholdPixels', 5.0))
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError('triangulationReprojectionThresholdPixels must be finite and positive')
     pairs = rows(root/'frame_sets.jsonl')
     output = root/'handpose'
     data = np.load(str(output/'wilor_2d.npz'))
@@ -115,7 +118,7 @@ def triangulate(root, config):
         used[start:end] = picked.sum(axis=(0,2)).reshape(-1,21)
         print('Anipose {}/{}'.format(end,n), flush=True)
     # Reject high reprojection residuals rather than labelling all finite points valid.
-    valid = np.isfinite(xyz).all(axis=2) & np.isfinite(error) & (error <= 5) & (used >= 2)
+    valid = np.isfinite(xyz).all(axis=2) & np.isfinite(error) & (error <= threshold) & (used >= 2)
     xyz[~valid] = np.nan
     np.savez_compressed(str(output/'pose_3d.npz'), joints=xyz, valid=valid,
                         reprojectionErrorPixels=error, camerasUsed=used,
@@ -137,7 +140,7 @@ def triangulate(root, config):
             handle.write(json.dumps(record, allow_nan=False)+'\n')
     (output/'pose_report.json').write_text(json.dumps(dict(frames=n,
         validJointFraction=float(valid.mean()), validFrameFraction=float(valid.all(axis=1).mean()),
-        reprojectionThresholdPixels=5, algorithm='WiLoR 2D + aniposelib RANSAC; no temporal interpolation',
+        reprojectionThresholdPixels=threshold, algorithm='WiLoR 2D + aniposelib RANSAC; no temporal interpolation',
         hardwareExposureSynchronized=False), indent=2))
     # Refresh immutable inputs for constraints whenever triangulation is rerun.
     shutil.copy2(output/'pose_3d.npz', output/'pose_3d_unconstrained.npz')

@@ -22,7 +22,7 @@
       "serial": "25132908"
     }
   ],
-  "fps": 20,
+  "fps": 30,
   "clockIntervalSeconds": 30,
   "maxPairSkewMs": 35,
   "hand": "right",
@@ -41,5 +41,6 @@
     "maxEvaluations": 200
   },
   "weightedHandpose": true,
-  "reliabilityPython": "~/environments/handpose/bin/python"
+  "reliabilityPython": "~/environments/handpose/bin/python",
+  "exposureTimeUs": 2000.0
 }

@@ -81,6 +81,8 @@ def main():
         obs=np.load(root/pose_dir/'observations.npz')
         w=dict(keypoints=np.concatenate([obs['augment_xy'][:,:,0],(obs['weight_image']>0)[...,None]],axis=-1))
         weighted_report=json.loads((root/pose_dir/'weighted_report.json').read_text())
+        if weighted_report.get('fitMode')=='joint':method_label='WiLoR + joint multiview reconstruction'
+        if weighted_report.get('fitMode')=='trajectory':method_label='WiLoR + asynchronous 3D trajectory'
     constrained=args.method=='wilor' and 'regularized' in p and bool(p['regularized'])
     regularization=json.loads((root/'handpose/regularization_report.json').read_text()) if constrained else None
     if constrained:method_label+=' + constraints'
@@ -101,7 +103,7 @@ def main():
     source_times=[np.array([(r['unixTimeMs']-origin)/1000 for r in rr]) for rr in source_rows]
     reprojections=np.full((4,len(times),21,2),np.nan)
     for ci,c in enumerate(cams):
-        xyz=p['joints'].reshape(-1,3);valid=np.isfinite(xyz).all(1)
+        xyz=(p['perViewJoints'][ci] if 'perViewJoints' in p else p['joints']).reshape(-1,3);valid=np.isfinite(xyz).all(1)
         if valid.any():
             reprojections[ci].reshape(-1,2)[valid]=cv2.projectPoints(xyz[valid],np.array(c['rotation']),np.array(c['translation']),np.array(c['matrix']),np.array(c['distortions']))[0].reshape(-1,2)
     residuals=np.linalg.norm(reprojections-w['keypoints'][...,:2],axis=-1)
@@ -117,7 +119,10 @@ def main():
                     p90Pixels=float(np.nanpercentile(residuals[ci],90)))
                     for ci,c in enumerate(cams) if np.isfinite(residuals[ci]).any()})
     (out/'all_view_reprojection_audit.json').write_text(json.dumps(audit,indent=2,allow_nan=False))
-    fps=20;count=math.ceil(duration*fps);cv2.setNumThreads(2)
+    fps=float(config.get('fps',20))
+    if not math.isfinite(fps) or fps<=0:raise ValueError('Invalid visualization FPS')
+    tolerance=.5/fps+.001
+    count=math.ceil(duration*fps);cv2.setNumThreads(2)
     enc=subprocess.Popen(['ffmpeg','-y','-loglevel','error','-f','rawvideo','-pix_fmt','bgr24','-s','1280x856',
         '-r',str(fps),'-i','-','-an','-c:v','libx264','-threads','4','-preset','fast','-crf','21','-pix_fmt','yuv420p',
         '-movflags','+faststart',str(out/'rgb_pose_review.pending.mp4')],stdin=subprocess.PIPE)
@@ -125,7 +130,7 @@ def main():
     snapshot_frames={round(t*fps) for t in (5,25,50,80)}
     try:
         for frame in range(count):
-            t=frame/fps;pi=nearest(times,t);paired=abs(times[pi]-t)<=.026
+            t=frame/fps;pi=nearest(times,t);paired=abs(times[pi]-t)<=tolerance
             canvas=np.full((856,1280,3),20,np.uint8)
             valid_count=int(p['valid'][pi].sum()) if paired else 0
             label(canvas,f'{method_label} | {t:6.2f} / {duration:.2f} s | reconstructed joints: {valid_count}/21',(16,23),scale=.63)
@@ -150,7 +155,7 @@ def main():
                 tile=cv2.warpAffine(image,affine,(640,400))
                 if paired:
                     skeleton(tile,cv2.transform(xy[None],affine)[0],good,(30,170,255))
-                    skeleton(tile,cv2.transform(reprojections[ci,pi][None],affine)[0],p['valid'][pi],(255,245,0),5)
+                    skeleton(tile,cv2.transform(reprojections[ci,pi][None],affine)[0],np.isfinite(reprojections[ci,pi]).all(1),(255,245,0),5)
                     if weighted:
                         fitted=cv2.transform(reprojections[ci,pi][None],affine)[0]
                         for j in range(21):
@@ -178,6 +183,7 @@ def main():
     if code:raise RuntimeError(f'ffmpeg exited {code}')
     (out/'rgb_pose_review.pending.mp4').replace(out/'rgb_pose_review.mp4')
     data=dict(session=session.name,duration=duration,origin=origin,times=clean(times,5),
+        fps=fps,poseMatchToleranceMs=tolerance*1000,
         poseMethod=args.method,methodLabel=method_label,
         regularization=({k:regularization[k] for k in ('method','settings','grossOutliersRejected','gapsFilled','beforeOnKeptJoints','after','originalSupportedViewsReprojectionPixels')} if constrained else None),
         calibrationLabel=Path(calibration_meta['calibrationSource']).parent.parent.name,
@@ -189,6 +195,7 @@ def main():
         geometryAudit=audit,threeViewCounts=((support>=3)&accepted).sum(1).tolist())
     if weighted:
         data['weightedReport']=weighted_report
+        if 'temporalInferred' in p:data['temporalInferred']=p['temporalInferred'].tolist()
         data['jointViewSupport']=p['camerasUsed'].tolist()
         data['viewWeights']=clean(p['weights'],3)
         data['reliabilityDetails']=dict(stabilityPixels=clean(obs['stability_pixels'],2),
@@ -206,8 +213,15 @@ def main():
         if candidate.get('outputPoseSha256')==hashlib.sha256((root/pose_dir/'pose_3d.npz').read_bytes()).hexdigest():
             data['stabilization']=candidate
     data['constraintsComparisonAvailable'] = (out/'constraints/comparison.html').is_file()
+    if capture.get('originalSession'):
+        data['session']=capture['originalSession']+' (candidate calibration)'
     template=Path(__file__).with_name('multicamera_viewer.template.html').read_text()
     rendered=template.replace('__DATA__',json.dumps(data,ensure_ascii=False,allow_nan=False,separators=(',',':')))
+    for target in (25,50,80):
+        if target>duration:rendered=rendered.replace(f'<button data-time="{target}">{target} s</button>','')
+    if capture.get('diagnosticCandidate'):
+        notice='<div id="diagnosticNotice" class="warning"><strong>DIAGNOSTIC CANDIDATE: camera calibration has not passed all validation checks.</strong> These poses and reliability weights are experimental. Formal calibration remains unchanged.</div>'
+        rendered=rendered.replace('</h1>','</h1>'+notice,1)
     revision=calibration_meta['calibrationSha256'][:12]+'-'+hashlib.sha256((root/pose_dir/'pose_3d.npz').read_bytes()).hexdigest()[:12]
     rendered=rendered.replace('__REVISION__',revision)
     if args.method=='wilor' and (root/'weighted_handpose/pose_3d.npz').exists():
@@ -215,7 +229,7 @@ def main():
         rendered=rendered.replace('</h1>','</h1>'+nav,1)
     (out/'viewer.pending.html').write_text(rendered)
     (out/'viewer.pending.html').replace(out/'viewer.html')
-    summary=dict(videoFrames=count,fps=fps,durationSeconds=duration,poseFrames=len(times),method=method_label,
+    summary=dict(videoFrames=count,fps=fps,poseMatchToleranceMs=tolerance*1000,durationSeconds=duration,poseFrames=len(times),method=method_label,
                  validJointFraction=float(p['valid'].mean()),completePoseFrames=int(p['valid'].all(1).sum()),
                  maxValidJointsPerFrame=int(p['valid'].sum(1).max()),imuSamples=len(imu),
                  calibration=calibration_meta['calibrationSource'],geometryAudit=audit,

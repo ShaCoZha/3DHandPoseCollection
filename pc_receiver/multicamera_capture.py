@@ -35,6 +35,10 @@ class CameraConfig:
             data.setdefault(key, default)
             if not isinstance(data[key], (int, float)) or not math.isfinite(data[key]) or data[key] <= 0:
                 raise ValueError(f"Invalid {key}")
+        if 'exposureTimeUs' in data:
+            value=data['exposureTimeUs']
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+                raise ValueError('exposureTimeUs must be a positive finite number in microseconds')
         data.setdefault('hand', 'right')
         if data['hand'] not in ('right', 'left'):
             raise ValueError('hand must be right or left (single-hand recording)')

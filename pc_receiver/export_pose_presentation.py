@@ -26,7 +26,7 @@ def sha256(path):
     return h.hexdigest()
 
 
-def pose_panel(xyz, support, center, radius, yaw, pitch, title, clean=False):
+def pose_panel(xyz, support, center, radius, yaw, pitch, title, clean=False, inferred=None):
     panel = np.full((432, 600, 3), (35, 28, 23), np.uint8)
     if not clean:
         label(panel, title, (18, 28), scale=.62)
@@ -63,6 +63,7 @@ def pose_panel(xyz, support, center, radius, yaw, pitch, title, clean=False):
     for j in np.flatnonzero(valid):
         color = (64,218,255) if not clean and support[j] < 2 else (230,217,80)
         cv2.circle(plot, point(uv[j]), 4, color, -1, cv2.LINE_AA)
+        if inferred is not None and inferred[j]:cv2.circle(plot,point(uv[j]),7,(64,218,255),1,cv2.LINE_AA)
         if not clean:
             cv2.putText(plot, str(j), point(uv[j] + [6,-5]), cv2.FONT_HERSHEY_SIMPLEX, .32, (225,225,225), 1, cv2.LINE_AA)
     panel[65:402] = plot
@@ -84,17 +85,26 @@ class CleanRenderer:
         else:
             with np.load(root / 'handpose/wilor_2d.npz') as obs:
                 self.xy = obs['keypoints'][...,:2].copy()
+        self.inferred = self.view_inferred = None
+        view_xyz = None
+        if method=='weighted':
+            with np.load(root / 'weighted_handpose/pose_3d.npz') as saved:
+                if 'perViewJoints' in saved:
+                    view_xyz=saved['perViewJoints'];self.inferred=saved['temporalInferred']
+                    self.view_inferred=saved['perViewTemporalInferred']
         self.projections = []
-        valid = np.isfinite(xyz).all(-1)
-        for camera in cameras(toml.load(root / 'calibration.toml')):
+        for ci,camera in enumerate(cameras(toml.load(root / 'calibration.toml'))):
+            positions=xyz if view_xyz is None else view_xyz[ci]
+            valid=np.isfinite(positions).all(-1)
             uv = np.full((*xyz.shape[:-1],2),np.nan)
-            uv[valid] = project(xyz[valid], camera)
+            uv[valid] = project(positions[valid], camera)
             self.projections.append(uv)
 
     def draw(self, t, pi, paired, center, radius, support):
         canvas = np.full((1080,1920,3), (30,21,16), np.uint8)
         label(canvas,'Orange: WiLoR',(24,38),(30,170,255),.8)
         label(canvas,'Cyan: projected 3D',(310,38),(255,245,0),.8)
+        if self.inferred is not None:label(canvas,'Yellow rings: temporal estimates',(660,38),(64,218,255),.62)
         for ci, reader in enumerate(self.readers):
             record = self.pairs[pi]['frames'][f'cam{ci+1:02d}'] if paired else self.records[ci][nearest(self.times[ci],t)]
             image = reader.read(record)
@@ -111,13 +121,17 @@ class CleanRenderer:
             tile = cv2.warpAffine(image,affine,(640,480))
             if paired:
                 skeleton(tile,cv2.transform(xy[None],affine)[0],good,(30,170,255))
-                skeleton(tile,cv2.transform(self.projections[ci][pi][None],affine)[0],np.isfinite(self.xyz[pi]).all(1),(255,245,0),5)
+                skeleton(tile,cv2.transform(self.projections[ci][pi][None],affine)[0],np.isfinite(self.projections[ci][pi]).all(1),(255,245,0),5)
+                if self.view_inferred is not None:
+                    uv=cv2.transform(self.projections[ci][pi][None],affine)[0]
+                    for j in np.flatnonzero(self.view_inferred[ci,pi]&np.isfinite(uv).all(1)):
+                        if np.abs(uv[j]).max()<10000:cv2.circle(tile,tuple(uv[j].astype(int)),8,(64,218,255),1,cv2.LINE_AA)
             tile[372:472,472:632] = cv2.resize(image,(160,100))
             cv2.rectangle(tile,(471,371),(632,472),(200,200,200),1)
             x,y = (ci%2)*640,64+(ci//2)*480
             canvas[y:y+480,x:x+640] = tile
         for y,yaw in [(64,.2),(544,.2+math.pi/2)]:
-            panel = pose_panel(self.xyz[pi] if paired else None,support,center,radius,yaw,-.35,'',clean=True)
+            panel = pose_panel(self.xyz[pi] if paired else None,support,center,radius,yaw,-.35,'',clean=True,inferred=self.inferred[pi] if self.inferred is not None and paired else None)
             canvas[y:y+480,1300:1900] = cv2.copyMakeBorder(panel,24,24,0,0,cv2.BORDER_CONSTANT,value=(35,28,23))
         return canvas
 
@@ -156,6 +170,7 @@ def export(session, clean=False):
     count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if not cap.isOpened() or abs(fps - report['fps']) > .001 or count != report['videoFrames']:
         raise ValueError('Source video metadata does not match its visualization report.')
+    tolerance=report.get('poseMatchToleranceMs',1000*(.5/fps+.001))/1000
     stem = 'rgb_2d_3d_clean' if clean else 'rgb_2d_3d_combined'
     output = out / f'{stem}.mp4'
     pending = out / f'{stem}.pending.mp4'
@@ -176,10 +191,11 @@ def export(session, clean=False):
                 raise ValueError('Expected the existing 1280x856 four-view video.')
             t = frame / fps
             pi = nearest(times,t)
-            paired = abs(times[pi]-t) <= .026
+            paired = abs(times[pi]-t) <= tolerance
             matched += int(paired)
             if clean:
                 canvas = renderer.draw(t,pi,paired,center,radius,support[pi])
+                label(canvas, 'Weighted 3D joints', (1320,38), (230,217,80), .8)
             else:
                 canvas = np.full((1080,1920,3), (30,21,16), np.uint8)
                 label(canvas, 'WiLoR | Four-View RGB + 2D Skeletons + Weighted 3D Pose', (20,32), scale=.85)
@@ -193,7 +209,7 @@ def export(session, clean=False):
                 if paired:
                     label(canvas, f'Pose frame {pi} | Valid joints: {np.isfinite(xyz[pi]).all(1).sum()}/21 | Four-view span: {pairs[pi]["cameraSkewMs"]:.2f} ms', (20,1015), scale=.59)
                 else:
-                    label(canvas, 'No pose within 26 ms of this video time. Missing joints are not filled.', (20,1015), (90,130,255), .59)
+                    label(canvas, f'No pose within {tolerance*1000:.1f} ms of this video time.', (20,1015), (90,130,255), .59)
                 label(canvas, 'Cameras expose at different times. Weights are heuristic; overlays are not ground truth.', (20,1043), scale=.52)
                 cv2.rectangle(canvas,(20,1060),(1900,1067),(70,60,50),-1)
                 cv2.rectangle(canvas,(20,1060),(20+round(1880*(frame+1)/count),1067),(220,190,70),-1)
@@ -216,13 +232,17 @@ def export(session, clean=False):
     summary = dict(session=session.name,output=str(output),sourceVideo=str(source),
                    sourceVideoSha256=sha256(source),poseSha256=digest,
                    frames=count,fps=fps,durationSeconds=count/fps,resolution=[1920,1080],
-                   framesWithMatchedPose=matched,poseMatchToleranceMs=26,
+                   framesWithMatchedPose=matched,poseMatchToleranceMs=tolerance*1000,
                    fixedDisplayCenterMetres=center.tolist(),fixedDisplayRadiusMetres=radius,
                    missingJointsFilled=0,labelsLanguage='en',
                    note='Reuses the existing RGB/2D/3D-reprojection video. Both independent 3D panels show the same timestamp-matched weighted pose from fixed orientations. No inference or interpolation.')
     if clean:
         summary.update(sourceVideo=str(root/'rgb'),sourceVideoSha256=None,
                        note='Rendered from original RGB and existing weighted 2D/3D predictions. Only orange WiLoR and cyan 3D skeletons; no diagnostic overlays, inference or interpolation.')
+    with np.load(root/'weighted_handpose/pose_3d.npz') as saved:
+        if 'trajectoryReconstruction' in saved:
+            summary.update(trajectoryReconstruction=True,temporalInferredFrameJoints=int(saved['temporalInferred'].sum()),
+                note='Native-camera-time 3D trajectory projections; independent panels show reference time. Yellow rings label short-gap estimates. No additional interpolation during export.')
     (out / ('clean_video_report.json' if clean else 'combined_video_report.json')).write_text(json.dumps(summary,indent=2)+'\n')
     print(json.dumps(summary,indent=2),flush=True)
 

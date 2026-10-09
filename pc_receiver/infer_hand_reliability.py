@@ -1,5 +1,5 @@
 """Resumeable WiLoR crop perturbation + mesh cache for the existing paired RGB frames."""
-import argparse, hashlib, json, os, time
+import argparse, fcntl, hashlib, json, os, time
 from pathlib import Path
 import cv2
 import numpy as np
@@ -8,7 +8,13 @@ from hand_reliability import cameras,leave_one_out,perturbed_boxes,mesh_surface_
 from visualize_multicamera import Reader,rows
 
 
-def run(session,limit=None,chunk_size=64):
+def assigned_chunks(n, chunk_size, shard_index=0, shard_count=1):
+    if chunk_size < 1 or shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError('Invalid chunk size or shard assignment')
+    return [start for i,start in enumerate(range(0,n,chunk_size)) if i % shard_count == shard_index]
+
+
+def run(session,limit=None,chunk_size=64,shard_index=0,shard_count=1):
     # Legacy MANO pickle imports chumpy, which still references removed aliases.
     # Keep this compatibility shim local to the inference process.
     for name,value in {'bool':bool,'int':int,'float':float,'complex':complex,
@@ -23,6 +29,12 @@ def run(session,limit=None,chunk_size=64):
     cache=out/('smoke_cache' if limit else 'cache');cache.mkdir(exist_ok=True)
     pairs=rows(root/'frame_sets.jsonl');pairs=pairs[:limit] if limit else pairs
     n=len(pairs);config=json.loads((root/'config.json').read_text());wanted=int(config['hand']=='right')
+    detector_kwargs={}
+    if 'detectorImageSize' in config:
+        size=config['detectorImageSize']
+        if type(size) is not int or not 64<=size<=2048 or size%32:
+            raise ValueError('detectorImageSize must be an integer multiple of 32 between 64 and 2048')
+        detector_kwargs['imgsz']=size
     original=np.load(root/'handpose/wilor_2d.npz');originalxy=original['keypoints'][:,:n,:,:2].copy()
     originalxy[original['keypoints'][:,:n,:,2]<.6]=np.nan
     cams=cameras(toml.load(root/'calibration.toml'));guide,_=leave_one_out(originalxy,cams)
@@ -30,21 +42,25 @@ def run(session,limit=None,chunk_size=64):
         inputSha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in [root/'frame_sets.jsonl',root/'calibration.toml',root/'handpose/wilor_2d.npz']},
         identityGuide='Other-three-view-only agreement <=12px; fallback to original selected skeleton; no external identity labels',
         meshMeaning='Visible fraction of fixed anatomical skin patches selected on rest mesh; predicted virtual camera; self-occlusion hint only')
+    if detector_kwargs:manifest['detectorImageSize']=detector_kwargs['imgsz']
     mp=cache/'manifest.json'
-    if mp.exists() and json.loads(mp.read_text())!=manifest:raise ValueError('Cache provenance mismatch; use a new output directory')
-    mp.write_text(json.dumps(manifest,indent=2))
+    with (cache/'manifest.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if mp.exists() and json.loads(mp.read_text())!=manifest:raise ValueError('Cache provenance mismatch; use a new output directory')
+        mp.write_text(json.dumps(manifest,indent=2))
     torch.set_num_threads(4);cv2.setNumThreads(2)
     model=WiLorHandPose3dEstimationPipeline(device=torch.device('cuda'),dtype=torch.float16,verbose=False)
-    faces=np.asarray(model.wilor_model.mano.faces,dtype=np.int32);np.save(out/'mano_faces.npy',faces)
+    faces=np.asarray(model.wilor_model.mano.faces,dtype=np.int32)
+    if shard_index==0:np.save(out/'mano_faces.npy',faces)
     mano=model.wilor_model.mano
     rest=mano.v_template.detach().cpu().float().numpy()
     rest_joints=mano.J_regressor.detach().cpu().float().numpy()@rest
     rest_joints=np.concatenate([rest_joints,rest[mano.extra_joints_idxs.cpu().numpy()]])[mano.joint_map.cpu().numpy()]
     surface_indices=np.argsort(((rest_joints[:,None]-rest[None])**2).sum(-1),axis=1)[:,:16]
-    np.save(out/'mano_joint_surface_indices.npy',surface_indices)
+    if shard_index==0:np.save(out/'mano_joint_surface_indices.npy',surface_indices)
     readers=[Reader(root) for _ in range(4)];started=time.monotonic()
     try:
-        for start in range(0,n,chunk_size):
+        for start in assigned_chunks(n,chunk_size,shard_index,shard_count):
             end=min(n,start+chunk_size);path=cache/f'{start:05d}.npz'
             if path.exists():continue
             count=end-start;shape=(4,count)
@@ -57,7 +73,7 @@ def run(session,limit=None,chunk_size=64):
             for f in range(start,end):
                 for ci,spec in enumerate(config['cameras']):
                     k=f-start;image=cv2.cvtColor(readers[ci].read(pairs[f]['frames'][spec['name']]),cv2.COLOR_BGR2RGB)
-                    det=model.hand_detector(image,conf=.3,verbose=False)[0].boxes.data.cpu().numpy()
+                    det=model.hand_detector(image,conf=.3,verbose=False,**detector_kwargs)[0].boxes.data.cpu().numpy()
                     det=det[det[:,5].astype(int)==wanted];d['candidate_count'][ci,k]=len(det)
                     entry=dict(frame=f,camera=spec['name'],candidates=det.tolist(),selected=None);candidates_log.append(entry)
                     if not len(det):continue
@@ -89,10 +105,15 @@ def run(session,limit=None,chunk_size=64):
             temp=path.with_suffix('.pending.npz');np.savez_compressed(temp,**d);temp.replace(path)
             path.with_suffix('.json').write_text(json.dumps(candidates_log))
             elapsed=time.monotonic()-started
-            (out/'processing_status.json').write_text(json.dumps(dict(status='inference',completedFrames=end,totalFrames=n,elapsedSeconds=elapsed)))
-            print(f'Reliability inference {end}/{n}, {elapsed:.1f}s',flush=True)
+            state=out/('processing_status.json' if shard_count==1 else f'inference_worker_{shard_index}.json')
+            state.write_text(json.dumps(dict(status='inference',completedFrames=end,totalFrames=n,elapsedSeconds=elapsed,
+                shardIndex=shard_index,shardCount=shard_count,progressMeaning='Last completed frame index in this shard; not global progress')))
+            print(f'Reliability inference {end}/{n}, {elapsed:.1f}s, shard {shard_index}/{shard_count}',flush=True)
     finally:
         for r in readers:r.close()
+    if shard_count>1:
+        (out/f'inference_worker_{shard_index}.json').write_text(json.dumps(dict(status='complete',shardIndex=shard_index,shardCount=shard_count)))
+        return
     chunks=[np.load(cache/f'{s:05d}.npz') for s in range(0,n,chunk_size)]
     d={k:np.concatenate([p[k] for p in chunks],axis=1 if k!='sourceFrameIndex' else 0) for k in chunks[0].files}
     d['weight_image'],d['stability_pixels'],d['stability_weight']=reliability(d['augment_xy'],d['visibility'],d['detector_score'],(1920,1200))
@@ -102,4 +123,7 @@ def run(session,limit=None,chunk_size=64):
         detectionsPerCamera=(d['detector_score']>0).sum(1).tolist(),guideSelectedPerCamera=(d['identity_source']==1).sum(1).tolist()),indent=2))
 
 if __name__=='__main__':
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('session');ap.add_argument('--limit',type=int);args=ap.parse_args();run(args.session,args.limit)
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('session');ap.add_argument('--limit',type=int)
+    ap.add_argument('--shard-index',type=int,default=0);ap.add_argument('--shard-count',type=int,default=1)
+    args=ap.parse_args();assigned_chunks(0,64,args.shard_index,args.shard_count)
+    run(args.session,args.limit,shard_index=args.shard_index,shard_count=args.shard_count)

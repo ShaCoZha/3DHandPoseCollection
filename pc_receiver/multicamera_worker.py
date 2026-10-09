@@ -70,6 +70,22 @@ class Worker:
             set_node('AcquisitionMode', PySpin.CEnumerationPtr, 'Continuous')
             set_node('AcquisitionFrameRateEnable', PySpin.CBooleanPtr, True)
             set_node('AcquisitionFrameRate', PySpin.CFloatPtr, float(self.config['fps']))
+            if 'exposureTimeUs' in self.config:
+                requested=float(self.config['exposureTimeUs'])
+                if not math.isfinite(requested) or requested<=0:
+                    raise ValueError(f'{name}: invalid exposureTimeUs')
+                set_node('ExposureAuto', PySpin.CEnumerationPtr, 'Off')
+                set_node('ExposureMode', PySpin.CEnumerationPtr, 'Timed')
+                exposure_node=PySpin.CFloatPtr(nodes.GetNode('ExposureTime'))
+                if not exposure_node.GetMin()<=requested<=exposure_node.GetMax():
+                    raise ValueError(f'{name}: exposureTimeUs {requested} outside camera range '
+                                     f'{exposure_node.GetMin()}..{exposure_node.GetMax()}')
+                set_node('ExposureTime', PySpin.CFloatPtr, requested)
+                actual=float(exposure_node.GetValue())
+                if abs(actual-requested)>max(20.,requested*.01):
+                    raise RuntimeError(f'{name}: exposure readback {actual} us != requested {requested} us')
+                stats.update(requestedExposureTimeUs=requested,configuredExposureTimeUs=actual,
+                             exposureAuto='Off',exposureMode='Timed')
             set_node('ChunkModeActive', PySpin.CBooleanPtr, True)
             for key in ('Timestamp', 'FrameID', 'ExposureTime'):
                 set_node('ChunkSelector', PySpin.CEnumerationPtr, key)
@@ -139,6 +155,11 @@ class Worker:
                         raw = int(chunk.GetTimestamp())
                         frame_id = int(chunk.GetFrameID())
                         exposure = float(chunk.GetExposureTime())
+                        if 'exposureTimeUs' in self.config:
+                            requested=float(self.config['exposureTimeUs'])
+                            if not math.isfinite(exposure) or abs(exposure-requested)>max(20.,requested*.01):
+                                raise RuntimeError(f'{name}: frame exposure {exposure} us != requested {requested} us')
+                        stats['lastFrameExposureTimeUs']=exposure
                         if previous_raw is not None and raw <= previous_raw:
                             raise RuntimeError('Camera hardware timestamp went backwards')
                         previous_raw = raw

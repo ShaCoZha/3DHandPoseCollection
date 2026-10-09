@@ -59,6 +59,9 @@ def imu_plot(samples,t,column,title,limit):
 
 def run(session,method='weighted',diagnostic=False):
     session=Path(session).resolve();root=session/'multicamera';out=session/'visualization'
+    capture_manifest=session/'capture.json'
+    if capture_manifest.exists():
+        diagnostic=diagnostic or bool(json.loads(capture_manifest.read_text()).get('diagnosticCandidate'))
     if method=='weighted':out=out/'weighted'
     pose=root/('weighted_handpose' if method=='weighted' else 'handpose')/'pose_3d.npz'
     with np.load(pose) as p:
@@ -86,7 +89,7 @@ def run(session,method='weighted',diagnostic=False):
             canvas=np.full((1280,1920,3),(30,21,16),np.uint8)
             canvas[:1080]=renderer.draw(t,pi,paired,center,radius,support[pi])
             if diagnostic:
-                label(canvas,'Unvalidated 3D: camera calibration mismatch',(980,38),(130,180,255),.64)
+                label(canvas,'Unvalidated 3D: candidate camera calibration',(980,38),(130,180,255),.64)
             heatmap,matched=draw_eit(metadata,eit,eit_times,t);matched_eit+=int(matched)
             canvas[544:1024,1300:1900]=heatmap
             canvas[1080:1280,:960]=imu_plot(imu,t,1,'Watch acceleration (m/s^2)',limits[0])

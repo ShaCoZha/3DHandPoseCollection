@@ -212,10 +212,12 @@ def main(session):
                     reprojectionErrorMeaning='median across available WiLoR views after constraints',
                     grossOutlierRejected=bool(outside[f,j]))
             target.write(json.dumps(row,allow_nan=False)+'\n')
-    quality=json.loads(report_raw.read_text());quality.update(validJointFraction=float(valid.mean()),validFrameFraction=float(valid.all(1).mean()),
+    quality=json.loads(report_raw.read_text());raw_threshold=quality.get('reprojectionThresholdPixels')
+    quality.update(validJointFraction=float(valid.mean()),validFrameFraction=float(valid.all(1).mean()),
         algorithm='WiLoR 2D + Anipose RANSAC + robust bone/real-time acceleration constraints',
         regularizationReport='regularization_report.json',reprojectionThresholdPixels=None,
-        validityMeaning='Raw subset acceptance minus gross outliers; constrained coordinates have not been reaccepted under the original 5px threshold')
+        initialReprojectionThresholdPixels=raw_threshold,
+        validityMeaning='Raw subset acceptance minus gross outliers; constrained coordinates have not been reaccepted under the initial reprojection threshold')
     (out/'pose_report.json').write_text(json.dumps(quality,indent=2))
     print(json.dumps({k:report[k] for k in ('grossOutliersRejected','beforeOnKeptJoints','after','correctionMm','originalSupportedViewsReprojectionPixels')},indent=2),flush=True)
     return report

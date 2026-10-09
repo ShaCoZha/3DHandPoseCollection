@@ -32,6 +32,15 @@ This is timestamp-based association, not hardware exposure synchronization. A ra
 
 For each view, the detector produces hand boxes and a whole-hand score. The baseline selects the largest hand of the configured side. During the reliability pass, selection uses a reference from the other three views when they agree; otherwise it falls back to the baseline selection, then the largest candidate. This association is a heuristic and can still select a bystander's hand.
 
+The reliability pass accepts an optional `detectorImageSize` in the session's
+`multicamera/config.json`, such as `1280`. This increases detector input
+resolution while keeping predictions in original-image coordinates. The override
+is recorded in the inference report and cache manifest, preventing reuse of
+observations made at a different detector resolution. Without an override, the
+installed detector's default is used (512 for the current checkpoint). Higher
+resolution may improve hand detection and handedness classification; it does not
+guarantee correct identity or joint locations.
+
 WiLoR predicts a hand mesh and 21 joints from the selected crop. Its projected 2D joints can exist even when a finger is hidden: they are model predictions, not proof that the joint was seen. The baseline's binary keypoint-validity channel is not a learned per-joint confidence score.
 
 ## 3. Per-joint reliability
@@ -88,6 +97,10 @@ Weights are computed before the final fit and then held fixed. The implementatio
 
 ## 5. Weighted 3D fitting
 
+Two modes are available. The legacy mode below refines an existing constrained
+3D pose. The new **joint** mode bypasses that pose and is described in section
+5.1. Select it explicitly; existing outputs are not automatically migrated.
+
 Anipose first generates candidate 3D joints from subsets containing at least two views. The baseline rejects nonfinite results and points whose selected-subset reprojection error exceeds 5 px. This subset test does not establish agreement across all four cameras.
 
 Baseline regularization estimates bone lengths from supported observations and checks for enough three-view support to establish the capture volume. Gross spatial outliers are rejected; missing joints are not invented. This stage can stop when the calibration and observations do not provide sufficient support.
@@ -105,9 +118,120 @@ The objective combines:
 | Weighted 2D reprojection | Make reliable views agree with a shared 3D joint | Cauchy |
 | Baseline 3D anchor | Stabilize depth when observations are weak | Soft-L1 |
 | Bone lengths | Discourage frame-to-frame finger stretching | Quadratic |
-| Timestamp-based acceleration | Reduce rapid, inconsistent motion | Quadratic |
+| Timestamp-based acceleration | Reduce rapid, inconsistent motion while allowing fast actions | Soft-L1 |
 
 The robust reprojection loss limits the influence of a badly wrong view. It does not make a geometrically incorrect calibration valid.
+
+### 5.1 Direct joint reconstruction
+
+`pc_receiver/fit_joint_handpose.py SESSION` reads cached `observations.npz`,
+camera calibration and matched timestamps. It does **not** read a baseline 3D
+pose, its missing-joint mask, its estimated bone lengths or its regularization
+report. To run inference as well, use
+`pc_receiver/process_weighted_handpose.py SESSION --fit-mode joint`.
+Both modes write `multicamera/weighted_handpose`; use a separate session/review
+directory to retain comparisons, as done for the CA6A diagnostic run.
+
+```mermaid
+flowchart LR
+    A["2D joints + per-view joint weights"] --> B["One joint 3D optimization"]
+    C["Fixed camera calibration"] --> B
+    A --> D["Camera-pair numerical seeds"]
+    C --> D
+    D -. "initial values only; no 3D anchor" .-> B
+    D --> E["Estimate bone lengths from supported seeds"]
+    E --> B
+    T["Actual timestamps + robust motion"] --> B
+    B --> F["Objective check + per-view residuals and support"]
+    F --> G["3D joints and RGB projections"]
+```
+
+The joint coordinates for a temporal window are the optimization variables:
+
+```text
+E(X) = sum(view, time, joint, coordinate)
+         weight * soft_L1(((project(X) - measured_2D) / 3 px)^2)
+       + sum(bone_length_residual^2)
+       + sum(soft_L1(timestamp_acceleration_residual^2))
+```
+
+All three terms act in the same solve. There is no penalty for leaving an old
+3D skeleton. Reliability multiplies the robust image loss, rather than changing
+its pixel transition scale. Image and motion losses use soft-L1; bone lengths
+use the same 1.5 mm / 4% scale as the legacy weighted mode. Camera intrinsics,
+extrinsics and weights are not optimized.
+
+Initialization tests camera pairs with weights at least 0.15 in both views,
+positive depth, at least a 2-degree ray intersection angle and at most 15 px
+error in each generating view. The pair candidates are ranked using the
+weighted robust image cost across **all** available views. These thresholds
+only establish numerical seeds, not final accuracy. Missing single-view joints
+remain missing. This mask differs from the legacy 5 px subset rejection mask,
+so comparisons must also report errors on the common joints. Bone lengths are
+re-estimated from the seeds using robust statistics, preferring three-view
+support; insufficient data causes an explicit error.
+
+After window blending, finite coordinates, positive camera depth and the same
+full joint objective are checked. A worse or invalid solve reverts to the
+numerical seeds, never to the old smoothed skeleton. Conflicting-view errors
+and fewer than two supporting views remain diagnostic flags: no whole-frame
+P90 rollback is applied. Passing this numerical safeguard is not proof of
+accurate 3D or anatomy. The current model has no explicit joint-angle or palm
+shape prior and still associates free-running camera frames at one nominal
+time; conflicting views can require a compromise.
+
+### 5.2 Camera-time trajectory fitting and short gaps
+
+Use `pc_receiver/fit_joint_handpose.py SESSION --mode trajectory` on an existing
+reliability cache, or `pc_receiver/process_weighted_handpose.py SESSION
+--fit-mode trajectory` to include reliability inference. As with joint mode,
+use a separate session/review directory to preserve previous results.
+
+The optimizer fits piecewise-linear 3D trajectories with knots at the common
+reference timestamps. For camera `c`, its original 2D observation at recorded
+time `t_c` constrains `project_c(X(t_c))`, rather than `project_c(X(t_reference))`.
+Both bracketing 3D knots contribute to the analytic projection Jacobian. Bone
+lengths and robust acceleration constrain the same trajectory in one solve;
+there is no old 3D anchor. Camera parameters and clock mappings stay fixed.
+
+Recorded per-camera timestamps come from `frame_sets.jsonl`. Their absolute
+exposure-start/end/midpoint convention has not been independently verified, so
+no exposure/2 correction is guessed. Long exposures integrate motion; the
+current model fits a point in time and does not undo that blur or unknown clock
+bias. Hardware triggering and shorter exposures remain complementary changes.
+
+For initialization and leave-one-view-out reliability only, 2D predictions are
+linearly interpolated to matching times, across gaps no larger than 120 ms.
+When aligned 2D seeds are unavailable, a valid native camera-pair seed can
+serve as a numerical guess; it is labelled `nativeSeedFallback` and is not a
+3D target. This avoids losing otherwise usable observations just because 2D
+interpolation is unavailable. The optimization itself uses the **original** 2D
+points at their original camera times, not interpolated predictions. Bone lengths are estimated from the
+time-aligned seeds. Interior missing 3D seeds are initialized only when valid
+seeds bracket the gap within 150 ms (normally up to two missing 20 Hz samples).
+Those coordinates are then jointly fitted using available image observations,
+bone constraints and neighboring trajectory. Long gaps and sequence endpoints
+remain missing; no extrapolation is performed.
+
+Nonfinite or behind-camera output knots are explicitly rejected. They are not
+bridged during projection, and cannot cause the entire recording to revert.
+The same full objective is compared on the remaining variables and observations
+before accepting the blended solution. These checks establish numerical
+consistency, not true 3D accuracy. Weakly constrained anatomical configurations
+can remain wrong even after convergence.
+
+Outputs add `temporalInferred`, `seedValid`, `perViewJoints`,
+`perViewTemporalInferred`, and `viewUnixTimeMs`. The JSONL labels inferred joints
+individually. `camerasUsed` counts nearby native observations explained by the
+trajectory; it is not proof of simultaneous multiview support at the knot.
+The RGB overlays use each camera's trajectory time; the independent 3D panel
+uses the reference time. Visualization and clean MP4 export use the session
+configured frame rate (30 FPS by default for new 2 ms captures). Pose matching is
+limited to half an output-frame interval plus 1 ms; a missing sample
+is not silently replaced by a pose a full frame away. Yellow rings mark short-gap estimates, including in
+the clean MP4. More displayed joints must not be presented as more measured
+joints or demonstrated accuracy. Reports compare reprojection errors on common
+observations, and separately count recovered and newly missing joints.
 
 ## 6. Bone and temporal consistency
 
@@ -125,6 +249,22 @@ acceleration    = 2 × (velocity_after - velocity_before)
 The default fit uses 80-frame windows with 20-frame overlap, blends overlapping solutions, and does not connect motion constraints across gaps longer than 0.12 seconds. Weighted fitting keeps the baseline's finite/missing joint mask unchanged.
 
 Stronger smoothness can suppress genuine fast motion or increase 2D reprojection error. Lower jitter alone does not prove better 3D accuracy.
+
+The weighted stage uses an acceleration residual scale of 10 m/s² with soft-L1
+loss (previously 2.5 m/s² with quadratic loss). This reduces the influence of
+large accelerations; the initial baseline regularization is unchanged.
+
+After overlapping windows are blended, a quality check uses the same fixed
+observations with weights at least 0.5 before and after fitting. With at least
+six such observations spanning two cameras, frame median and P90 errors may
+increase by at most the larger of 2 px or 10% of their baseline value. Each joint
+with at least two high-weight views is also checked: its median error may
+increase by at most the larger of 5 px or 25%. A failed check restores the whole
+baseline frame, preserving its missing-joint mask. Non-converged windows also
+use their input poses. Unchecked frames and fallback frames are recorded in the
+report and NPZ/JSONL outputs. The pre-check candidate is saved separately.
+This guards agreement with predictions, not ground-truth accuracy, and does not
+repair a bad baseline. Frame rollbacks may introduce temporal discontinuities.
 
 ## 7. What happens to an occluded finger?
 

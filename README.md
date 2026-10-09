@@ -73,6 +73,8 @@ Run from this repository root:
 python scripts/run.py collect
 ```
 
+The local collection config sets `fps: 30` and `exposureTimeUs: 2000` (2 ms). The camera worker disables automatic exposure, selects Timed mode, checks the camera range, and verifies the readback before acquisition. Per-frame chunk exposure values remain recorded in the frame JSONL files. Gain is unchanged; provide enough illumination for the shorter exposure. Omit the field to inherit camera exposure settings.
+
 The receiver listens on port **8765** and writes to `data/dataset_multicamera/<sessionId>/`. Start and stop synchronized acquisition from the iPhone client. The default local configuration enables the weighted hand pose pipeline after capture.
 
 To use another port:
@@ -112,6 +114,10 @@ python scripts/run.py process data/dataset_multicamera/<sessionId> --stage trian
 python scripts/run.py process data/dataset_multicamera/<sessionId> --stage regularize
 python scripts/run.py weighted data/dataset_multicamera/<sessionId>
 ```
+
+On a GPU with sufficient memory, `weighted ... --inference-workers 2` (up to 4)
+assigns disjoint inference chunks to separate processes. All frames and the same
+model/weighting logic are retained; existing compatible chunks are reused.
 
 The session's `multicamera/config.json` controls its processing environments. Old sessions retain their original settings. Reliability caches include input hashes; changing calibration or frame pairing requires a fresh cache/output directory. Do not overwrite a candidate's provenance or silently reuse an incompatible cache.
 
